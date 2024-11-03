@@ -4,43 +4,44 @@ import tempfile
 import time
 import traceback
 
-def verify_lean_file(
+def verify_lean_with_goals(
     code: str,
-    lake_path: str = "lake", # Path to lake executable
-    lean_workspace: str = ".", # Path to your Lean project directory
+    lean_workspace: str,
     timeout: int = 300
 ) -> dict:
     """
-    Verify a Lean 4 file and return the results.
-
-    Args:
-        code: The Lean code to verify
-        lake_path: Path to the lake executable
-        lean_workspace: Path to the Lean project directory (with lakefile.lean)
-        timeout: Maximum time in seconds to wait for verification
-
-    Returns:
-        dict containing verification results including:
-        - pass: Whether verification succeeded
-        - complete: Whether proof is complete (no sorries)
-        - errors: List of error messages
-        - warnings: List of warning messages
-        - verify_time: Time taken for verification
+    Run Lean code and get goal states at each step.
+    Assumes working directory is mathlib4 root.
     """
-    # Prepare the command to send to Lean
-    command = {"cmd": code}
+    # Wrap the code in a namespace and add imports
+    modified_lines = [
+        "import Mathlib.Tactic",
+        "namespace TestTheorem"
+    ]
+
+    # Add the original code
+    modified_lines.extend(code.strip().split('\n'))
+
+    # Close namespace
+    modified_lines.append("end TestTheorem")
+
+    # Join all lines
+    modified_code = "\n".join(modified_lines)
+
+    # Prepare command for Lean REPL
+    command = {
+        "cmd": modified_code,
+        "allTactics": True
+    }
     message_str = json.dumps(command, ensure_ascii=False)
 
-    start_time = time.time()
     try:
-        # Create temporary file to hold the input
         with tempfile.TemporaryFile(mode='w+', encoding='utf-8') as temp_file:
             temp_file.write(message_str + "\r\n\r\n")
             temp_file.seek(0)
 
-            # Run Lean through lake
             outputs = subprocess.run(
-                [lake_path, "exe", "repl"],
+                ["lake", "exe", "repl"],
                 stdin=temp_file,
                 capture_output=True,
                 text=True,
@@ -48,51 +49,54 @@ def verify_lean_file(
                 timeout=timeout
             )
 
-            # Parse the output
-            result = json.loads(outputs.stdout)
+            if outputs.stderr:
+                print("STDERR:", outputs.stderr)
 
-            # Format the response
-            formatted_result = {
-                "sorries": result.get('sorries', []),
-                "errors": [m for m in result.get('messages', []) if m['severity'] == 'error'],
-                "warnings": [m for m in result.get('messages', []) if m['severity'] == 'warning'],
-                "infos": [m for m in result.get('messages', []) if m['severity'] == 'info'],
-                "verified_code": code,
+            result = json.loads(outputs.stdout)
+            return {
+                "pass": not any(m['severity'] == 'error' for m in result.get('messages', [])),
+                "messages": result.get('messages', []),
+                "stdout": outputs.stdout,
+                "stderr": outputs.stderr
             }
 
-            # Add pass/complete flags
-            formatted_result['pass'] = not formatted_result['errors']
-            formatted_result['complete'] = (
-                formatted_result['pass'] and
-                not formatted_result['sorries'] and
-                not any("declaration uses 'sorry'" in warning['data']
-                       for warning in formatted_result['warnings'])
-            )
-
     except Exception as e:
-        formatted_result = {
+        return {
             "pass": False,
-            "complete": False,
             "error": str(e),
             "traceback": traceback.format_exc()
         }
 
-    formatted_result['verify_time'] = time.time() - start_time
-    return formatted_result
-
-# Example usage
 if __name__ == "__main__":
-    # Example Lean code
+    # Test theorem
     test_code = """
-    theorem test_theorem : 2 + 2 = 4 := by
-      simp
-    """
+theorem add_comm (n m : Nat) : n + m = m + n := by
+  induction n with
+  | zero =>
+    simp
+  | succ n ih =>
+    simp [Nat.succ_add]
+    rw [ih]
+    rfl
+"""
 
     # Run verification
-    result = verify_lean_file(
+    result = verify_lean_with_goals(
         test_code,
-        lean_workspace="./mathlib4"  # Replace with your Lean project path
+        lean_workspace="./mathlib4"  # Replace with your mathlib4 path
     )
 
+    print(result)
+
     # Print results
-    print(json.dumps(result, indent=2))
+    print("Verification:", "✓" if result['pass'] else "✗")
+
+    if result.get('error'):
+        print("\nError:", result['error'])
+    else:
+        print("\nMessages:")
+        for msg in result['messages']:
+            if msg['severity'] == 'error':
+                print(f"Error at line {msg['pos']['line']}: {msg['data']}")
+            elif msg['severity'] == 'info':
+                print(f"Info: {msg['data']}")
