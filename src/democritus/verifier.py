@@ -80,13 +80,10 @@ theorem add_comm (n m : Nat) : n + m = m + n := by
     rfl
 """
 
-    # Run verification
     result = verify_lean_with_goals(
         test_code,
         lean_workspace="./mathlib4"  # Replace with your mathlib4 path
     )
-
-    print(result)
 
     # Print results
     print("Verification:", "✓" if result['pass'] else "✗")
