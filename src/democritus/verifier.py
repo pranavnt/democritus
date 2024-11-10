@@ -47,8 +47,6 @@ def verify_lean_code(
 
             result = json.loads(outputs.stdout)
 
-            print(result)
-
             # Check if there are any sorries in the proof
             has_sorry = len(result.get('sorries', [])) > 0
 
@@ -118,6 +116,8 @@ theorem amc12b_2003_p6 (a r : ℝ) (u : ℕ → ℝ) (h₀ : ∀ k, u k = a * r 
 
     # Print results
     print(f"Verification result: {'✓' if result['pass'] else '✗'}")
+
+    print(json.dumps(result['result'], indent=2))
 
     if result.get('error'):
         print("\nError:", result['error'])
