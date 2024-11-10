@@ -4,7 +4,7 @@ import tempfile
 import traceback
 from typing import Dict
 
-def verify_lean_code(
+def verify(
     code: str,
     lean_workspace: str,
     timeout: int = 300
@@ -108,7 +108,7 @@ theorem amc12b_2003_p6 (a r : ℝ) (u : ℕ → ℝ) (h₀ : ∀ k, u k = a * r 
   simpa [h₀] using h₄
 }"""
 
-    result = verify_lean_code(
+    result = verify(
         code=test_code,
         lean_workspace="./mathlib4",
         timeout=300
