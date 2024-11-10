@@ -3,8 +3,9 @@ import json
 import tempfile
 import time
 import traceback
+from typing import Dict, Optional
 
-def verify_lean_with_goals(
+def verify_lean_code(
     code: str,
     lean_workspace: str,
     timeout: int = 300
@@ -12,30 +13,23 @@ def verify_lean_with_goals(
     """
     Run Lean code and get goal states at each step.
     Assumes working directory is mathlib4 root.
+
+    Args:
+        code: Complete Lean code including imports and namespace
+        lean_workspace: Path to mathlib4 workspace
+        timeout: Maximum execution time in seconds
+
+    Returns:
+        Dict containing verification results
     """
-    # Wrap the code in a namespace and add imports
-    modified_lines = [
-        "import Mathlib.Tactic",
-        "namespace TestTheorem"
-    ]
-
-    # Add the original code
-    modified_lines.extend(code.strip().split('\n'))
-
-    # Close namespace
-    modified_lines.append("end TestTheorem")
-
-    # Join all lines
-    modified_code = "\n".join(modified_lines)
-
-    # Prepare command for Lean REPL
-    command = {
-        "cmd": modified_code,
-        "allTactics": True
-    }
-    message_str = json.dumps(command, ensure_ascii=False)
-
     try:
+        # Prepare command for Lean REPL
+        command = {
+            "cmd": code,
+            "allTactics": True
+        }
+        message_str = json.dumps(command, ensure_ascii=False)
+
         with tempfile.TemporaryFile(mode='w+', encoding='utf-8') as temp_file:
             temp_file.write(message_str + "\r\n\r\n")
             temp_file.seek(0)
@@ -60,6 +54,12 @@ def verify_lean_with_goals(
                 "stderr": outputs.stderr
             }
 
+    except subprocess.TimeoutExpired:
+        return {
+            "pass": False,
+            "error": f"Verification timed out after {timeout} seconds",
+            "traceback": traceback.format_exc()
+        }
     except Exception as e:
         return {
             "pass": False,
@@ -67,32 +67,72 @@ def verify_lean_with_goals(
             "traceback": traceback.format_exc()
         }
 
-if __name__ == "__main__":
-    # Test theorem
-    test_code = """
-theorem add_comm (n m : Nat) : n + m = m + n := by
-  induction n with
-  | zero =>
-    simp
-  | succ n ih =>
-    simp [Nat.succ_add]
-    rw [ih]
-    rfl
-"""
+def verify_problem_json(
+    problem: Dict,
+    lean_workspace: str,
+    timeout: int = 300
+) -> Dict:
+    """
+    Verify a Lean theorem from a problem JSON object.
 
-    result = verify_lean_with_goals(
-        test_code,
-        lean_workspace="./mathlib4"  # Replace with your mathlib4 path
+    Args:
+        problem: Dict containing problem data with 'header' and 'formal_statement'
+        lean_workspace: Path to mathlib4 workspace
+        timeout: Maximum execution time in seconds
+
+    Returns:
+        Dict containing verification results
+    """
+    # Combine header and formal statement
+    code_parts = []
+    if 'header' in problem:
+        code_parts.append(problem['header'])
+    if 'formal_statement' in problem:
+        code_parts.append(problem['formal_statement'])
+
+    code = '\n'.join(code_parts)
+
+    # Run verification
+    result = verify_lean_code(code, lean_workspace, timeout)
+
+    return {
+        "problem_id": problem.get('id', 'unknown'),
+        "verification_result": result
+    }
+
+if __name__ == "__main__":
+    # Test example
+    test_problem = {
+        "id": "amc12a_2015_10",
+        "header": """import Mathlib
+import Aesop
+
+set_option maxHeartbeats 0
+
+open BigOperators Real Nat Topology Rat
+
+theorem amc12b_2003_p6 (a r : ℝ) (u : ℕ → ℝ) (h₀ : ∀ k, u k = a * r ^ k) (h₁ : u 1 = 2)
+  (h₂ : u 3 = 6) : u 0 = 2 / Real.sqrt 3 ∨ u 0 = -(2 / Real.sqrt 3) := by
+    sorry
+"""
+    }
+
+    result = verify_problem_json(
+        test_problem,
+        lean_workspace="./mathlib4",  # Replace with your mathlib4 path
+        timeout=300
     )
 
-    # Print results
-    print("Verification:", "✓" if result['pass'] else "✗")
+    print(result)
 
-    if result.get('error'):
-        print("\nError:", result['error'])
+    # Print results
+    print(f"Verification for {result['problem_id']}: {'✓' if result['verification_result']['pass'] else '✗'}")
+
+    if result['verification_result'].get('error'):
+        print("\nError:", result['verification_result']['error'])
     else:
         print("\nMessages:")
-        for msg in result['messages']:
+        for msg in result['verification_result']['messages']:
             if msg['severity'] == 'error':
                 print(f"Error at line {msg['pos']['line']}: {msg['data']}")
             elif msg['severity'] == 'info':
