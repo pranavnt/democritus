@@ -35,12 +35,30 @@ class RMSNorm(torch.nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+def precompute_freqs_cis(
+    dim: int,
+    end: int,
+    theta: float = 10000.0,
+    scale: Optional[float] = None,
+):
+    # Adjust dimension for rotary embeddings
+    dim = dim // 2
+    # Generate frequency ranges
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, dtype=torch.float32) / dim))
+    # Generate position ranges, scaled if necessary
+    if scale is not None:
+        t = torch.arange(end, dtype=torch.float32) / scale
+    else:
+        t = torch.arange(end, dtype=torch.float32)
+
+    # Compute frequency bands
     freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
-    return freqs_cis
+    # Convert to complex numbers
+    freqs_cos = torch.cos(freqs)
+    freqs_sin = torch.sin(freqs)
+
+    # Return complex rotary embeddings
+    return torch.complex(freqs_cos, freqs_sin)
 
 def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     ndim = x.ndim
@@ -90,7 +108,7 @@ class Linear(nn.Module):
         return F.linear(x, self.weight, self.bias)
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs) -> None:
         super().__init__()
         self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
         self.n_local_heads = args.n_heads
@@ -103,8 +121,13 @@ class Attention(nn.Module):
         self.wv = Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
+        # Initialize caches with None - they'll be created for the specific batch size when needed
         self.cache_k = None
         self.cache_v = None
+
+        # Store max sequence length for proper cache initialization
+        self.max_seq_len = args.max_seq_len
+        self.max_batch_size = args.max_batch_size
 
     def forward(
         self,
@@ -122,13 +145,14 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        if self.cache_k is None:
+        # Initialize or reset caches if needed
+        if self.cache_k is None or self.cache_k.size(0) != bsz:
             self.cache_k = torch.zeros(
-                (bsz, start_pos + seqlen, self.n_local_kv_heads, self.head_dim),
+                (bsz, self.max_seq_len, self.n_local_kv_heads, self.head_dim),
                 device=x.device, dtype=x.dtype
             )
             self.cache_v = torch.zeros(
-                (bsz, start_pos + seqlen, self.n_local_kv_heads, self.head_dim),
+                (bsz, self.max_seq_len, self.n_local_kv_heads, self.head_dim),
                 device=x.device, dtype=x.dtype
             )
 
@@ -213,18 +237,36 @@ class Transformer(nn.Module):
         self.n_layers = params.n_layers
 
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
+
+        # Initialize layers
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
 
+        # Output layers
         self.norm = RMSNorm(params.dim, eps=params.norm_eps)
         self.output = Linear(params.dim, params.vocab_size, bias=False)
+
+        # Compute RoPE frequencies
+        scale = None
+        if params.use_scaled_rope:
+            scale = params.rope_scaling.get("factor", 1.0) if params.rope_scaling else 1.0
 
         self.freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
             params.max_seq_len * 2,
-            params.rope_theta,
+            theta=params.rope_theta,
+            scale=scale,
         )
+
+        # Apply rotary embedding scaling if specified
+        if params.use_scaled_rope and params.rope_scaling:
+            scaling_type = params.rope_scaling.get("type", "linear")
+            if scaling_type == "linear":
+                self.freqs_cis = self.freqs_cis * scale
+            elif scaling_type == "dynamic":
+                base = params.rope_scaling.get("factor", 1.0)
+                self.freqs_cis = self.freqs_cis * (base ** torch.arange(self.freqs_cis.shape[0], device=self.freqs_cis.device))
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):

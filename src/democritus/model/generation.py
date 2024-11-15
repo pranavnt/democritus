@@ -163,6 +163,11 @@ class Llama:
         eos_reached = torch.tensor([False] * bsz, device=device)
         input_text_mask = tokens != pad_id
 
+        # Reset KV-cache at the start of each generation
+        for layer in self.model.layers:
+            layer.attention.cache_k = None
+            layer.attention.cache_v = None
+
         if min_prompt_len == total_len:
             logits = self.model.forward(tokens, prev_pos)
             token_logprobs = -F.cross_entropy(
