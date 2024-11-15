@@ -12,6 +12,7 @@ dependencies = [
     "blobfile>=3.0.0",
     "safetensors>=0.4.5",
     "fairscale>=0.4.13",
+    "fire>=0.7.0",
 ]
 
 [build-system]
