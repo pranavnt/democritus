@@ -1,390 +1,302 @@
-from typing import List, NamedTuple, Optional, Tuple
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# This software may be used and distributed in accordance with the terms of the Llama 3 Community License Agreement.
+
+import math
 from dataclasses import dataclass
-from pathlib import Path
+from typing import Optional, Tuple
 
-import jax
-import jax.numpy as jnp
-
-from functools import partial
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as PS
-from jax.experimental import mesh_utils
-from jax.experimental.pallas.ops.gpu.rms_norm import rms_norm as pl_rms_norm
-
-from democritus.model.config import ModelParams
-from democritus.model.kvcache import KVCache
-
-# First define the weight classes needed by the model
-class LayerWeights(NamedTuple):
-    wq: jax.Array
-    wk: jax.Array
-    wv: jax.Array
-    wo: jax.Array
-    w1: jax.Array
-    w2: jax.Array
-    w3: jax.Array
-    ffn_norm: jax.Array
-    attention_norm: jax.Array
+import fairscale.nn.model_parallel.initialize as fs_init
+import torch
+import torch.nn.functional as F
+from fairscale.nn.model_parallel.layers import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
+from torch import nn
 
 
-class XfmrWeights(NamedTuple):
-    tok_embeddings: jax.Array
-    norm: jax.Array
-    output: jax.Array
-    layer_weights: List[LayerWeights]
+@dataclass
+class ModelArgs:
+    dim: int = 4096
+    n_layers: int = 32
+    n_heads: int = 32
+    n_kv_heads: Optional[int] = None
+    vocab_size: int = -1
+    multiple_of: int = 256  # make SwiGLU hidden layer size multiple of large power of 2
+    ffn_dim_multiplier: Optional[float] = None
+    norm_eps: float = 1e-5
+    rope_theta: float = 500000
 
-class KVCache(NamedTuple):
-    k: jax.Array
-    v: jax.Array
+    max_batch_size: int = 32
+    max_seq_len: int = 2048
 
-    @classmethod
-    @partial(jax.jit, static_argnums=(0, 1, 2, 3, 4, 5))
-    def new(
-        cls, layers: int, bsz: int, max_seq_len: int, kv_heads: int, head_dim: int
-    ) -> "KVCache":
-        return cls(
-            k=jnp.zeros(
-                (layers, bsz, max_seq_len, kv_heads, head_dim), dtype=jnp.bfloat16
-            ),
-            v=jnp.zeros(
-                (layers, bsz, max_seq_len, kv_heads, head_dim), dtype=jnp.bfloat16
-            ),
-        )
 
-    def update(
-        self, xk: jax.Array, xv: jax.Array, layer_idx: int, cur_pos: int, n_rep: int
-    ):
-        ck = jax.lax.dynamic_update_slice(
-            self.k, jnp.bfloat16(xk[None, ...]), (layer_idx, 0, cur_pos, 0, 0)
-        )
-        cv = jax.lax.dynamic_update_slice(
-            self.v, jnp.bfloat16(xv[None, ...]), (layer_idx, 0, cur_pos, 0, 0)
-        )
-        keys = jnp.repeat(ck[layer_idx], n_rep, axis=2)
-        values = jnp.repeat(cv[layer_idx], n_rep, axis=2)
+class RMSNorm(torch.nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
-        return keys, values, KVCache(k=ck, v=cv)
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-shard = jax.lax.with_sharding_constraint
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
 
-DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
-def rms_norm(x: jax.Array, w: jax.Array, eps: float = 1e-6) -> jax.Array:
-    x = shard(x, PS())
-    return w * (x * jax.lax.rsqrt(jax.lax.pow(x, 2).mean(-1, keepdims=True) + eps))
+def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    freqs = torch.outer(t, freqs)
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    return freqs_cis
+
+
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
 
 
 def apply_rotary_emb(
-    xq: jax.Array,
-    xk: jax.Array,
-    freqs_cis: jax.Array,
-    dtype: jnp.dtype = jnp.float32
-) -> Tuple[jax.Array, jax.Array]:
-    """Apply rotary embeddings to query and key tensors.
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
 
-    Args:
-        xq: Query tensor of shape [batch, seq_len, num_heads, head_dim]
-        xk: Key tensor of shape [batch, seq_len, num_heads, head_dim]
-        freqs_cis: Precomputed frequencies [seq_len, dim]
-    """
-    seqlen = xq.shape[1]
 
-    # Reshape xq and xk to split channels
-    xq_r = xq.reshape(*xq.shape[:-1], -1, 2)
-    xk_r = xk.reshape(*xk.shape[:-1], -1, 2)
-
-    # Split into even and odd channels
-    xq_even = xq_r[..., 0]
-    xq_odd = xq_r[..., 1]
-    xk_even = xk_r[..., 0]
-    xk_odd = xk_r[..., 1]
-
-    # Reshape freqs for broadcasting
-    freqs = freqs_cis[:seqlen]  # [seq_len, dim]
-    freqs_cos = jnp.cos(freqs)[None, :, None, :]  # [1, seq, 1, dim]
-    freqs_sin = jnp.sin(freqs)[None, :, None, :]  # [1, seq, 1, dim]
-
-    # Apply rotation
-    out_q = jnp.stack(
-        [
-            xq_even * freqs_cos - xq_odd * freqs_sin,
-            xq_odd * freqs_cos + xq_even * freqs_sin,
-        ],
-        axis=-1,
-    )
-    out_k = jnp.stack(
-        [
-            xk_even * freqs_cos - xk_odd * freqs_sin,
-            xk_odd * freqs_cos + xk_even * freqs_sin,
-        ],
-        axis=-1,
-    )
-
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+    bs, slen, n_kv_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
     return (
-        out_q.reshape(xq.shape).astype(dtype),
-        out_k.reshape(xk.shape).astype(dtype)
+        x[:, :, :, None, :]
+        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
-def attention(
-    x: jax.Array,
-    layer_weights: LayerWeights,
-    model_params,
-    cur_pos: int,
-    layer_idx: int,
-    freqs_cis: jax.Array,
-    kvcache: KVCache,
-    attn_mask: Optional[jax.Array] = None,
-) -> Tuple[jax.Array, KVCache]:
-    """Multi-head attention with KV cache."""
-    bsz, seqlen, _ = x.shape
-    n_rep = model_params.n_local_heads // model_params.n_local_kv_heads
 
-    # Project query, key, value
-    xq = jnp.einsum("bse,ehd->bshd", x, layer_weights.wq)  # [batch, seq, heads, dim]
-    xk = jnp.einsum("bse,ehd->bshd", x, layer_weights.wk)  # [batch, seq, kv_heads, dim]
-    xv = jnp.einsum("bse,ehd->bshd", x, layer_weights.wv)  # [batch, seq, kv_heads, dim]
+class Attention(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.n_kv_heads = args.n_heads if args.n_kv_heads is None else args.n_kv_heads
+        model_parallel_size = fs_init.get_model_parallel_world_size()
+        self.n_local_heads = args.n_heads // model_parallel_size
+        self.n_local_kv_heads = self.n_kv_heads // model_parallel_size
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.dim // args.n_heads
 
-    # Apply rotary embeddings
-    xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-
-    # Update KV cache
-    keys, values, kvcache = kvcache.update(xk, xv, layer_idx, cur_pos, n_rep)
-
-    # Attention scores
-    scores = jnp.einsum("bqhd,bkhd->bhqk", xq, keys) / jnp.sqrt(model_params.head_dim)
-    scores = scores.astype(jnp.float32)  # Always do attention softmax at float32
-
-    if attn_mask is not None:
-        scores = scores.at[..., :attn_mask.shape[-1]].add(attn_mask)
-
-    # Mask padding tokens
-    mask = jnp.where(scores != 0.0, scores, DEFAULT_MASK_VALUE)
-    padded_scores = jnp.where((mask >= DEFAULT_MASK_VALUE * 0.5), scores, DEFAULT_MASK_VALUE)
-
-    # Softmax and attention
-    probs = jax.nn.softmax(padded_scores, axis=-1).astype(x.dtype)
-    output = jnp.einsum("bhqk,bkhd->bqhd", probs, values)
-
-    # Reshape and project output
-    output = output.reshape(bsz, seqlen, -1)
-    output = jnp.dot(output, layer_weights.wo)
-
-    return shard(output, PS()), kvcache, scores
-
-def precompute_freqs_cis(
-    dim: int, end: int, theta: float = 500000.0
-) -> jax.Array:
-    """Precompute frequencies for rotary embeddings."""
-    # Generate frequency bands
-    freqs = 1.0 / (theta ** (jnp.arange(0, dim, 2, dtype=jnp.float32) / dim))
-
-    # Generate time/position indices
-    t = jnp.arange(end, dtype=jnp.float32)
-
-    # Outer product -> [seq, dim/2]
-    emb = jnp.einsum('i,j->ij', t, freqs)
-
-    return emb  # [seq_len, dim/2]
-
-def feed_forward(x: jax.Array, layer_weights: LayerWeights) -> jax.Array:
-    """Feed forward network with SwiGLU activation.
-
-    Args:
-        x: Input of shape [batch, seq_len, hidden_dim]
-        layer_weights: Layer weights containing w1, w2, w3 matrices
-
-    Returns:
-        Output of shape [batch, seq_len, hidden_dim]
-    """
-    x = shard(x, PS())  # [batch, seq, hidden]
-
-    # First projection and activation
-    w1 = layer_weights.w1.T  # [hidden, ffn_dim]
-    w3 = layer_weights.w3.T  # [hidden, ffn_dim]
-    w2 = layer_weights.w2.T  # [ffn_dim, hidden]
-
-    # Project to larger dimension and apply SwiGLU
-    h1 = jax.nn.silu(shard(jnp.einsum('bsh,hf->bsf', x, w1), PS(None, None, "mp")))
-    h3 = shard(jnp.einsum('bsh,hf->bsf', x, w3), PS(None, None, "mp"))
-    h = h1 * h3  # SwiGLU activation
-
-    # Project back to hidden dimension
-    out = shard(jnp.einsum('bsf,fh->bsh', h, w2), PS())
-
-    return out
-
-def xfmr(
-    xfmr_weights: XfmrWeights,
-    model_params: ModelParams,
-    tokens: jax.Array,
-    cur_pos: int,
-    freqs_cis: jax.Array,
-    kvcache: KVCache,
-    attn_mask: Optional[jax.Array] = None,
-) -> Tuple[jax.Array, KVCache]:
-    h = xfmr_weights.tok_embeddings[tokens]
-    for i in range(model_params.n_layers):
-        norm_x = rms_norm(h, xfmr_weights.layer_weights[i].attention_norm)
-        h_attn, kvcache, scores = attention(
-            norm_x,
-            xfmr_weights.layer_weights[i],
-            model_params,
-            cur_pos,
-            i,
-            freqs_cis,
-            kvcache,
-            attn_mask=attn_mask,
+        self.wq = ColumnParallelLinear(
+            args.dim,
+            args.n_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
         )
-        h = h + h_attn
-        h = h + feed_forward(
-            rms_norm(h, xfmr_weights.layer_weights[i].ffn_norm),
-            xfmr_weights.layer_weights[i],
+        self.wk = ColumnParallelLinear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
+        )
+        self.wv = ColumnParallelLinear(
+            args.dim,
+            self.n_kv_heads * self.head_dim,
+            bias=False,
+            gather_output=False,
+            init_method=lambda x: x,
+        )
+        self.wo = RowParallelLinear(
+            args.n_heads * self.head_dim,
+            args.dim,
+            bias=False,
+            input_is_parallel=True,
+            init_method=lambda x: x,
         )
 
-    normed = rms_norm(h, xfmr_weights.norm)
-    print(normed.shape)
-    print(xfmr_weights.output.shape)
-    logits = jnp.dot(normed, xfmr_weights.output)
-    return logits, kvcache, scores
-
-# Add weight loading code at the end
-@dataclass
-class WeightConfig:
-    """Configuration for weight loading and sharding."""
-    dp_dim: str = "dp"
-    mp_dim: str = "mp"
-    fsdp_dim: str = "fsdp"
-
-
-def create_mesh(device_count: int) -> jax.sharding.Mesh:
-    """Creates device mesh for distributed execution."""
-    devices = jax.devices()
-    mesh_shape = (device_count, 1)
-    device_mesh = mesh_utils.create_device_mesh(mesh_shape)
-    return Mesh(device_mesh, ("mp", "fsdp"))
-
-
-def create_partition_spec(key):
-    dp = "dp"
-    mp = "mp"
-    fsdp = "fsdp"
-    if "norm" in key:
-        return PS()
-    if "rope.freqs" in key:
-        return PS()
-    elif "tok_embeddings" in key:
-        return PS(fsdp, mp)
-    elif "output" in key:
-        return PS(fsdp, mp)
-    elif "w2" in key or "wo" in key:
-        return PS(mp, fsdp)
-    else:
-        return PS(fsdp, mp)
-
-
-def load_weights(
-    ckpt_dir: Path, model_params, weight_config: Optional[WeightConfig] = None
-) -> Tuple[XfmrWeights, jax.sharding.Mesh]:
-    """Load and shard model weights across devices."""
-    weight_config = weight_config or WeightConfig()
-    mesh = create_mesh(jax.device_count())
-
-    w = {}
-    layer_weights = []
-
-    for file in ckpt_dir.glob("*.npy"):
-        name = ".".join(str(file).split("/")[-1].split(".")[:-1])
-        weight = jnp.load(file=file, mmap_mode="r", allow_pickle=True)
-        partition_spec = create_partition_spec(name)
-        sharding = NamedSharding(mesh, partition_spec)
-        if any(lyr in name for lyr in ["wq", "wk", "wv", "wo", "w1", "w2", "w3"]):
-            weight = weight.T
-            if "wq" in name or "wk" in name or "wv" in name:
-                weight = weight.reshape(
-                    -1,
-                    model_params.n_local_heads
-                    if "wq" in name
-                    else model_params.n_local_kv_heads,
-                    model_params.head_dim,
-                )
-        w[name] = jax.device_put(weight, sharding)
-
-    for i in range(model_params.n_layers):
-        layer_weights.append(
-            LayerWeights(
-                wq=w[f"layers.{i}.attention.wq.weight"],
-                wk=w[f"layers.{i}.attention.wk.weight"],
-                wv=w[f"layers.{i}.attention.wv.weight"],
-                wo=w[f"layers.{i}.attention.wo.weight"],
-                w1=w[f"layers.{i}.feed_forward.w1.weight"],
-                w2=w[f"layers.{i}.feed_forward.w2.weight"],
-                w3=w[f"layers.{i}.feed_forward.w3.weight"],
-                ffn_norm=w[f"layers.{i}.ffn_norm.weight"],
-                attention_norm=w[f"layers.{i}.attention_norm.weight"],
+        self.cache_k = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
             )
+        ).cuda()
+        self.cache_v = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cuda()
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ):
+        bsz, seqlen, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        self.cache_k = self.cache_k.to(xq)
+        self.cache_v = self.cache_v.to(xq)
+
+        self.cache_k[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v[:bsz, start_pos : start_pos + seqlen] = xv
+
+        keys = self.cache_k[:bsz, : start_pos + seqlen]
+        values = self.cache_v[:bsz, : start_pos + seqlen]
+
+        # repeat k/v heads if n_kv_heads < n_heads
+        keys = repeat_kv(
+            keys, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(
+            values, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(
+            1, 2
+        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        return self.wo(output)
+
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        multiple_of: int,
+        ffn_dim_multiplier: Optional[float],
+    ):
+        super().__init__()
+        hidden_dim = int(2 * hidden_dim / 3)
+        # custom dim factor multiplier
+        if ffn_dim_multiplier is not None:
+            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
+
+        self.w1 = ColumnParallelLinear(
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        )
+        self.w2 = RowParallelLinear(
+            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+        )
+        self.w3 = ColumnParallelLinear(
+            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
 
-    xfmr_weights = XfmrWeights(
-        tok_embeddings=w["tok_embeddings.weight"],
-        norm=w["norm.weight"],
-        output=w["output.weight"],
-        layer_weights=layer_weights,
-    )
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
-    return xfmr_weights, mesh
 
-def generate(params, input_ids, max_length):
-    """
-    Generate tokens using KV caching for efficient inference.
-    """
-    batch_size = input_ids.shape[0]
-    cur_pos = 0
+class TransformerBlock(nn.Module):
+    def __init__(self, layer_id: int, args: ModelArgs):
+        super().__init__()
+        self.n_heads = args.n_heads
+        self.dim = args.dim
+        self.head_dim = args.dim // args.n_heads
+        self.attention = Attention(args)
+        self.feed_forward = FeedForward(
+            dim=args.dim,
+            hidden_dim=4 * args.dim,
+            multiple_of=args.multiple_of,
+            ffn_dim_multiplier=args.ffn_dim_multiplier,
+        )
+        self.layer_id = layer_id
+        self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
+        self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
-    # Initialize KV cache
-    kvcache = KVCache.create(
-        batch_size=batch_size,
-        seq_len=max_length,
-        n_layer=params.n_layer,
-        n_head=params.n_head,
-        head_dim=params.head_dim
-    )
+    def forward(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+    ):
+        h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
+        out = h + self.feed_forward(self.ffn_norm(h))
+        return out
 
-    # Initial forward pass with the entire prompt
-    freqs_cis = precompute_freqs_cis(params.head_dim, max_length)
-    mask = create_mask(input_ids.shape[1])
 
-    logits, kvcache = transformer(
-        params,
-        input_ids,
-        freqs_cis[:input_ids.shape[1]],
-        mask,
-        kvcache,
-        cur_pos
-    )
+class Transformer(nn.Module):
+    def __init__(self, params: ModelArgs):
+        super().__init__()
+        self.params = params
+        self.vocab_size = params.vocab_size
+        self.n_layers = params.n_layers
 
-    cur_pos += input_ids.shape[1]
-    next_token = jnp.argmax(logits[:, -1], axis=-1)
-
-    output_ids = [next_token]
-
-    # Generate tokens one at a time
-    for i in range(max_length - input_ids.shape[1]):
-        # Create mask for the current position
-        mask = create_mask(cur_pos + 1)[-1:]  # Only need mask for new token
-
-        logits, kvcache = transformer(
-            params,
-            next_token[:, None],
-            freqs_cis[cur_pos:cur_pos+1],
-            mask,
-            kvcache,
-            cur_pos
+        self.tok_embeddings = VocabParallelEmbedding(
+            params.vocab_size, params.dim, init_method=lambda x: x
         )
 
-        next_token = jnp.argmax(logits[:, -1], axis=-1)
-        output_ids.append(next_token)
-        cur_pos += 1
+        self.layers = torch.nn.ModuleList()
+        for layer_id in range(params.n_layers):
+            self.layers.append(TransformerBlock(layer_id, params))
 
-        if next_token[0] == params.eos_token_id:
-            break
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
+        self.output = ColumnParallelLinear(
+            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
+        )
 
-    return jnp.stack(output_ids, axis=1)
+        self.freqs_cis = precompute_freqs_cis(
+            params.dim // params.n_heads,
+            params.max_seq_len * 2,
+            params.rope_theta,
+        )
+
+    @torch.inference_mode()
+    def forward(self, tokens: torch.Tensor, start_pos: int):
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings(tokens)
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
+
+            mask = torch.triu(mask, diagonal=1)
+
+            # When performing key-value caching, we compute the attention scores
+            # only for the new sequence. Thus, the matrix of scores is of size
+            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+            # j > cache_len + i, since row i corresponds to token cache_len + i.
+            mask = torch.hstack(
+                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
+            ).type_as(h)
+
+        for layer in self.layers:
+            h = layer(h, start_pos, freqs_cis, mask)
+        h = self.norm(h)
+        output = self.output(h).float()
+        return output
