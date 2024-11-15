@@ -1,3 +1,5 @@
 .venv/
 .DS_Store
 src/democritus/__pycache__/
+src/democritus/lean/__pycache__/
+src/democritus/model/__pycache__/
