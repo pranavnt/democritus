@@ -121,7 +121,7 @@ class Attention(nn.Module):
         self.wv = Linear(args.dim, self.n_kv_heads * self.head_dim, bias=False)
         self.wo = Linear(args.n_heads * self.head_dim, args.dim, bias=False)
 
-        # Initialize caches with None - they'll be created for the specific batch size when needed
+        # Change cache initialization to None
         self.cache_k = None
         self.cache_v = None
 
@@ -145,25 +145,31 @@ class Attention(nn.Module):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        # Initialize or reset caches if needed
-        if self.cache_k is None or self.cache_k.size(0) != bsz:
-            self.cache_k = torch.zeros(
-                (bsz, self.max_seq_len, self.n_local_kv_heads, self.head_dim),
-                device=x.device, dtype=x.dtype
-            )
-            self.cache_v = torch.zeros(
-                (bsz, self.max_seq_len, self.n_local_kv_heads, self.head_dim),
-                device=x.device, dtype=x.dtype
-            )
+        # Only use KV cache during evaluation/inference
+        if not self.training:
+            # Initialize or reset caches if needed
+            if self.cache_k is None or self.cache_k.size(0) != bsz:
+                self.cache_k = torch.zeros(
+                    (bsz, self.max_seq_len, self.n_local_kv_heads, self.head_dim),
+                    device=x.device, dtype=x.dtype
+                )
+                self.cache_v = torch.zeros(
+                    (bsz, self.max_seq_len, self.n_local_kv_heads, self.head_dim),
+                    device=x.device, dtype=x.dtype
+                )
 
-        self.cache_k = self.cache_k.to(xq.device)
-        self.cache_v = self.cache_v.to(xq.device)
+            self.cache_k = self.cache_k.to(xq.device)
+            self.cache_v = self.cache_v.to(xq.device)
 
-        self.cache_k[:bsz, start_pos:start_pos + seqlen] = xk
-        self.cache_v[:bsz, start_pos:start_pos + seqlen] = xv
+            self.cache_k[:bsz, start_pos:start_pos + seqlen] = xk
+            self.cache_v[:bsz, start_pos:start_pos + seqlen] = xv
 
-        keys = self.cache_k[:bsz, :start_pos + seqlen]
-        values = self.cache_v[:bsz, :start_pos + seqlen]
+            keys = self.cache_k[:bsz, :start_pos + seqlen]
+            values = self.cache_v[:bsz, :start_pos + seqlen]
+        else:
+            # During training, just use the current keys and values
+            keys = xk
+            values = xv
 
         # repeat k/v heads if n_kv_heads < n_heads
         keys = repeat_kv(keys, self.n_rep)

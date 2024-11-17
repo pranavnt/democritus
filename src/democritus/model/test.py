@@ -3,6 +3,7 @@
 
 from typing import List
 import fire
+import time
 
 from democritus.model.generation import Llama
 
@@ -15,7 +16,7 @@ def main(
     max_seq_len: int = 128,
     max_gen_len: int = 64,
     max_batch_size: int = 4,
-    device: str = "auto",
+    device: str = "mps",
 ):
     """
     Examples to run with the pre-trained models (no fine-tuning). Prompts are
@@ -34,6 +35,7 @@ def main(
         max_batch_size: Maximum batch size (default: 4)
         device: Device to run on ("cpu", "cuda", "mps", or "auto") (default: "auto")
     """
+    start_time = time.time()
     generator = Llama.build(
         ckpt_dir=ckpt_dir,
         tokenizer_path=tokenizer_path,
@@ -41,6 +43,8 @@ def main(
         max_batch_size=max_batch_size,
         device=device,
     )
+    build_time = time.time() - start_time
+    print(f"\nModel build time: {build_time:.2f} seconds")
 
     prompts: List[str] = [
         # For these prompts, the expected answer is the natural continuation of the prompt
@@ -60,12 +64,15 @@ def main(
         cheese =>""",
     ]
 
+    start_time = time.time()
     results = generator.text_completion(
         prompts,
         max_gen_len=max_gen_len,
         temperature=temperature,
         top_p=top_p,
     )
+    completion_time = time.time() - start_time
+    print(f"\nText completion time for {len(prompts)} prompts: {completion_time:.2f} seconds")
 
     for prompt, result in zip(prompts, results):
         print(prompt)
@@ -82,12 +89,15 @@ def main(
         ]
     ]
 
+    start_time = time.time()
     chat_results = generator.chat_completion(
         dialogs,
         max_gen_len=max_gen_len,
         temperature=temperature,
         top_p=top_p,
     )
+    chat_time = time.time() - start_time
+    print(f"\nChat completion time for {len(dialogs)} dialogs: {chat_time:.2f} seconds")
 
     print("\nChat Completion Examples:\n")
     for dialog, result in zip(dialogs, chat_results):
